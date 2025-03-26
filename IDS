@@ -1,0 +1,256 @@
+import scapy.all as scapy
+import logging
+from datetime import datetime
+import ipaddress
+import socket
+import threading
+import queue
+import json
+import os
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox, filedialog
+
+class LightweightIDSGUI:
+    def __init__(self, master):
+        """
+        Initialize the Lightweight Intrusion Detection System GUI
+        
+        :param master: Tkinter root window
+        """
+        self.master = master
+        master.title("Lightweight Intrusion Detection System")
+        master.geometry("800x600")
+
+        # Create IDS instance
+        self.config_path = 'ids_config.json'
+        self.ids = self._create_ids()
+
+        # Logging configuration
+        logging.basicConfig(
+            filename='ids_alerts.log', 
+            level=logging.WARNING,
+            format='%(asctime)s - %(levelname)s: %(message)s'
+        )
+
+        # Create GUI components
+        self._create_interface_section()
+        self._create_config_section()
+        self._create_alerts_section()
+        
+        # Monitoring status
+        self.is_monitoring = False
+        self.monitoring_thread = None
+
+    def _create_ids(self):
+        """
+        Create IDS instance with default interface
+        
+        :return: LightweightIDS instance
+        """
+        return LightweightIDS(interface='eth0', config_path=self.config_path)
+
+    def _create_interface_section(self):
+        """
+        Create network interface selection section
+        """
+        interface_frame = ttk.LabelFrame(self.master, text="Network Interface")
+        interface_frame.pack(padx=10, pady=10, fill="x")
+
+        # Interface selection
+        self.interface_var = tk.StringVar(value='eth0')
+        interface_entry = ttk.Entry(interface_frame, textvariable=self.interface_var, width=30)
+        interface_entry.pack(side=tk.LEFT, padx=10, pady=5)
+
+        # Start/Stop monitoring button
+        self.monitor_button = ttk.Button(
+            interface_frame, 
+            text="Start Monitoring", 
+            command=self._toggle_monitoring
+        )
+        self.monitor_button.pack(side=tk.LEFT, padx=10, pady=5)
+
+    def _create_config_section(self):
+        """
+        Create configuration management section
+        """
+        config_frame = ttk.LabelFrame(self.master, text="Configuration")
+        config_frame.pack(padx=10, pady=10, fill="x")
+
+        # Whitelist IPs
+        ttk.Label(config_frame, text="Whitelist IPs (comma-separated):").pack(anchor='w', padx=10)
+        self.whitelist_var = tk.StringVar()
+        whitelist_entry = ttk.Entry(config_frame, textvariable=self.whitelist_var, width=50)
+        whitelist_entry.pack(padx=10, pady=5, fill='x')
+
+        # Blacklist IPs
+        ttk.Label(config_frame, text="Blacklist IPs (comma-separated):").pack(anchor='w', padx=10)
+        self.blacklist_var = tk.StringVar()
+        blacklist_entry = ttk.Entry(config_frame, textvariable=self.blacklist_var, width=50)
+        blacklist_entry.pack(padx=10, pady=5, fill='x')
+
+        # Save Configuration Button
+        save_config_btn = ttk.Button(config_frame, text="Save Configuration", command=self._save_configuration)
+        save_config_btn.pack(padx=10, pady=5)
+
+        # Load Configuration Button
+        load_config_btn = ttk.Button(config_frame, text="Load Configuration", command=self._load_configuration)
+        load_config_btn.pack(padx=10, pady=5)
+
+    def _create_alerts_section(self):
+        """
+        Create alerts display section
+        """
+        alerts_frame = ttk.LabelFrame(self.master, text="Alerts")
+        alerts_frame.pack(padx=10, pady=10, expand=True, fill="both")
+
+        # Scrolled text area for alerts
+        self.alerts_text = scrolledtext.ScrolledText(
+            alerts_frame, 
+            wrap=tk.WORD, 
+            width=80, 
+            height=15
+        )
+        self.alerts_text.pack(padx=10, pady=10, expand=True, fill="both")
+
+        # Clear Alerts Button
+        clear_alerts_btn = ttk.Button(alerts_frame, text="Clear Alerts", command=self._clear_alerts)
+        clear_alerts_btn.pack(padx=10, pady=5)
+
+    def _save_configuration(self):
+        """
+        Save configuration to JSON file
+        """
+        try:
+            config = {
+                'whitelist_ips': [ip.strip() for ip in self.whitelist_var.get().split(',') if ip.strip()],
+                'blacklist_ips': [ip.strip() for ip in self.blacklist_var.get().split(',') if ip.strip()],
+                'syn_flood_threshold': 100,
+                'syn_flood_window': 10,
+                'port_scan_unique_ports': 10,
+                'port_scan_window': 60
+            }
+
+            with open(self.config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            messagebox.showinfo("Configuration", "Configuration saved successfully!")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save configuration: {e}")
+
+    def _load_configuration(self):
+        """
+        Load configuration from JSON file
+        """
+        try:
+            with open(self.config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Update GUI elements
+            self.whitelist_var.set(', '.join(config.get('whitelist_ips', [])))
+            self.blacklist_var.set(', '.join(config.get('blacklist_ips', [])))
+            
+            messagebox.showinfo("Configuration", "Configuration loaded successfully!")
+        except FileNotFoundError:
+            messagebox.showwarning("Warning", "No configuration file found.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load configuration: {e}")
+
+    def _toggle_monitoring(self):
+        """
+        Start or stop network monitoring
+        """
+        if not self.is_monitoring:
+            # Start monitoring
+            try:
+                # Update IDS with current interface
+                self.ids = LightweightIDS(
+                    interface=self.interface_var.get(), 
+                    config_path=self.config_path
+                )
+                
+                # Override alert handler to use GUI
+                self.ids.alert_queue = queue.Queue()
+                self.ids.alert_handler = self._gui_alert_handler
+
+                # Start monitoring in a separate thread
+                self.monitoring_thread = threading.Thread(
+                    target=self._monitoring_thread_func, 
+                    daemon=True
+                )
+                self.monitoring_thread.start()
+
+                # Update button and status
+                self.monitor_button.config(text="Stop Monitoring")
+                self.is_monitoring = True
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to start monitoring: {e}")
+        else:
+            # Stop monitoring
+            self.is_monitoring = False
+            self.monitor_button.config(text="Start Monitoring")
+            if self.monitoring_thread:
+                self.monitoring_thread.join(timeout=2)
+
+    def _monitoring_thread_func(self):
+        """
+        Thread function for monitoring network
+        """
+        try:
+            # Start packet and alert handler threads
+            packet_thread = threading.Thread(target=self.ids.packet_handler, daemon=True)
+            alert_thread = threading.Thread(target=self._gui_alert_handler, daemon=True)
+            
+            packet_thread.start()
+            alert_thread.start()
+            
+            self._log_to_alerts(f"[*] Starting IDS monitoring on interface {self.ids.interface}")
+            
+            # Capture packets and add to queue
+            scapy.sniff(
+                iface=self.ids.interface, 
+                prn=lambda packet: self.ids.packet_queue.put(packet),
+                store=0,
+                stop_filter=lambda x: not self.is_monitoring
+            )
+        except Exception as e:
+            self._log_to_alerts(f"Monitoring error: {e}")
+        finally:
+            self._log_to_alerts("[*] Stopped IDS monitoring")
+            self.is_monitoring = False
+            self.monitor_button.config(text="Start Monitoring")
+
+    def _gui_alert_handler(self):
+        """
+        Process and display alerts in GUI
+        """
+        while self.is_monitoring:
+            try:
+                alert = self.ids.alert_queue.get(timeout=1)
+                self._log_to_alerts(f"[ALERT] {json.dumps(alert, indent=2)}")
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self._log_to_alerts(f"Alert handling error: {e}")
+
+    def _log_to_alerts(self, message):
+        """
+        Log message to alerts text area
+        
+        :param message: Message to log
+        """
+        self.alerts_text.insert(tk.END, message + '\n')
+        self.alerts_text.see(tk.END)
+
+    def _clear_alerts(self):
+        """
+        Clear alerts text area
+        """
+        self.alerts_text.delete(1.0, tk.END)
+
+def main():
+    root = tk.Tk()
+    app = LightweightIDSGUI(root)
+    root.mainloop()
+
+if __name__ == '__main__':
+    main()

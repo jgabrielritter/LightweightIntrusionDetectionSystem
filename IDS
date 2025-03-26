@@ -10,6 +10,226 @@ import os
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, filedialog
 
+class LightweightIDS:
+    def __init__(self, interface='eth0', config_path='ids_config.json', alert_callback=None):
+        """
+        Initialize the Lightweight Intrusion Detection System
+        
+        :param interface: Network interface to monitor
+        :param config_path: Path to configuration file
+        :param alert_callback: Optional callback for alert handling
+        """
+        # Logging configuration
+        logging.basicConfig(
+            filename='ids_alerts.log', 
+            level=logging.WARNING,
+            format='%(asctime)s - %(levelname)s: %(message)s'
+        )
+        
+        # Load configuration
+        self.config = self._load_config(config_path)
+        
+        # Network interface
+        self.interface = interface
+        
+        # Threat detection queues
+        self.packet_queue = queue.Queue()
+        self.alert_queue = queue.Queue()
+        
+        # Alert callback for GUI integration
+        self.alert_callback = alert_callback
+        
+        # Threat detection thresholds
+        self.thresholds = {
+            'syn_flood': {
+                'count': self.config.get('syn_flood_threshold', 100),
+                'window_seconds': self.config.get('syn_flood_window', 10)
+            },
+            'port_scan': {
+                'unique_ports': self.config.get('port_scan_unique_ports', 10),
+                'window_seconds': self.config.get('port_scan_window', 60)
+            }
+        }
+        
+        # Tracking dictionaries for threat detection
+        self.syn_connections = {}
+        self.port_scans = {}
+    
+    def _load_config(self, config_path):
+        """
+        Load configuration from JSON file
+        
+        :param config_path: Path to configuration file
+        :return: Configuration dictionary
+        """
+        default_config = {
+            'syn_flood_threshold': 100,
+            'syn_flood_window': 10,
+            'port_scan_unique_ports': 10,
+            'port_scan_window': 60,
+            'whitelist_ips': [],
+            'blacklist_ips': []
+        }
+        
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    return {**default_config, **config}
+            return default_config
+        except Exception as e:
+            logging.error(f"Error loading configuration: {e}")
+            return default_config
+    
+    def _is_ip_suspicious(self, ip):
+        """
+        Check if an IP is suspicious based on whitelist/blacklist
+        
+        :param ip: IP address to check
+        :return: Boolean indicating suspiciousness
+        """
+        whitelist = self.config.get('whitelist_ips', [])
+        blacklist = self.config.get('blacklist_ips', [])
+        
+        if ip in blacklist:
+            return True
+        
+        if whitelist and ip not in whitelist:
+            return True
+        
+        return False
+    
+    def detect_syn_flood(self, packet):
+        """
+        Detect potential SYN flood attack
+        
+        :param packet: Network packet to analyze
+        """
+        current_time = datetime.now()
+        
+        # Check if packet is a TCP SYN packet
+        if packet.haslayer(scapy.TCP) and packet[scapy.TCP].flags == 0x02:
+            src_ip = packet[scapy.IP].src
+            
+            # Skip if IP is whitelisted
+            if not self._is_ip_suspicious(src_ip):
+                return
+            
+            # Clean up old entries
+            self.syn_connections = {
+                ip: times for ip, times in self.syn_connections.items() 
+                if (current_time - times[0]).total_seconds() < self.thresholds['syn_flood']['window_seconds']
+            }
+            
+            # Track SYN connections
+            if src_ip not in self.syn_connections:
+                self.syn_connections[src_ip] = []
+            
+            self.syn_connections[src_ip].append(current_time)
+            
+            # Check if SYN connection threshold is exceeded
+            if len(self.syn_connections[src_ip]) > self.thresholds['syn_flood']['count']:
+                alert = {
+                    'type': 'SYN Flood',
+                    'source_ip': src_ip,
+                    'timestamp': current_time.isoformat(),
+                    'syn_count': len(self.syn_connections[src_ip])
+                }
+                self._handle_alert(alert)
+    
+    def detect_port_scan(self, packet):
+        """
+        Detect potential port scanning activity
+        
+        :param packet: Network packet to analyze
+        """
+        current_time = datetime.now()
+        
+        if packet.haslayer(scapy.TCP):
+            src_ip = packet[scapy.IP].src
+            dst_port = packet[scapy.TCP].dport
+            
+            # Skip if IP is whitelisted
+            if not self._is_ip_suspicious(src_ip):
+                return
+            
+            # Clean up old entries
+            self.port_scans = {
+                ip: ports for ip, ports in self.port_scans.items() 
+                if (current_time - ports['start_time']).total_seconds() < self.thresholds['port_scan']['window_seconds']
+            }
+            
+            # Track port scans
+            if src_ip not in self.port_scans:
+                self.port_scans[src_ip] = {
+                    'ports': set(),
+                    'start_time': current_time
+                }
+            
+            self.port_scans[src_ip]['ports'].add(dst_port)
+            
+            # Check if unique port threshold is exceeded
+            if len(self.port_scans[src_ip]['ports']) > self.thresholds['port_scan']['unique_ports']:
+                alert = {
+                    'type': 'Port Scan',
+                    'source_ip': src_ip,
+                    'timestamp': current_time.isoformat(),
+                    'unique_ports': list(self.port_scans[src_ip]['ports'])
+                }
+                self._handle_alert(alert)
+    
+    def _handle_alert(self, alert):
+        """
+        Handle detected alerts
+        
+        :param alert: Alert dictionary
+        """
+        # Log to file
+        logging.warning(f"Potential {alert['type']} from {alert['source_ip']}")
+        
+        # Add to alert queue
+        self.alert_queue.put(alert)
+        
+        # Call callback if provided (for GUI)
+        if self.alert_callback:
+            self.alert_callback(alert)
+    
+    def packet_handler(self):
+        """
+        Process packets from the queue
+        """
+        while True:
+            packet = self.packet_queue.get()
+            
+            # Run detection algorithms
+            self.detect_syn_flood(packet)
+            self.detect_port_scan(packet)
+            
+            self.packet_queue.task_done()
+    
+    def start_monitoring(self):
+        """
+        Start network monitoring
+        """
+        try:
+            # Start packet handler thread
+            packet_thread = threading.Thread(target=self.packet_handler, daemon=True)
+            packet_thread.start()
+            
+            print(f"[*] Starting IDS monitoring on interface {self.interface}")
+            
+            # Capture packets and add to queue
+            scapy.sniff(
+                iface=self.interface, 
+                prn=lambda packet: self.packet_queue.put(packet),
+                store=0
+            )
+        
+        except KeyboardInterrupt:
+            print("\n[*] Stopping IDS...")
+        except Exception as e:
+            logging.error(f"Monitoring error: {e}")
+
 class LightweightIDSGUI:
     def __init__(self, master):
         """
@@ -21,9 +241,8 @@ class LightweightIDSGUI:
         master.title("Lightweight Intrusion Detection System")
         master.geometry("800x600")
 
-        # Create IDS instance
+        # Configuration path
         self.config_path = 'ids_config.json'
-        self.ids = self._create_ids()
 
         # Logging configuration
         logging.basicConfig(
@@ -40,14 +259,7 @@ class LightweightIDSGUI:
         # Monitoring status
         self.is_monitoring = False
         self.monitoring_thread = None
-
-    def _create_ids(self):
-        """
-        Create IDS instance with default interface
-        
-        :return: LightweightIDS instance
-        """
-        return LightweightIDS(interface='eth0', config_path=self.config_path)
+        self.ids = None
 
     def _create_interface_section(self):
         """
@@ -58,8 +270,11 @@ class LightweightIDSGUI:
 
         # Interface selection
         self.interface_var = tk.StringVar(value='eth0')
-        interface_entry = ttk.Entry(interface_frame, textvariable=self.interface_var, width=30)
-        interface_entry.pack(side=tk.LEFT, padx=10, pady=5)
+        interface_label = ttk.Label(interface_frame, text="Interface:")
+        interface_label.pack(side=tk.LEFT, padx=(10,5), pady=5)
+        
+        interface_entry = ttk.Entry(interface_frame, textvariable=self.interface_var, width=20)
+        interface_entry.pack(side=tk.LEFT, padx=5, pady=5)
 
         # Start/Stop monitoring button
         self.monitor_button = ttk.Button(
@@ -87,6 +302,34 @@ class LightweightIDSGUI:
         self.blacklist_var = tk.StringVar()
         blacklist_entry = ttk.Entry(config_frame, textvariable=self.blacklist_var, width=50)
         blacklist_entry.pack(padx=10, pady=5, fill='x')
+
+        # Thresholds frame
+        thresholds_frame = ttk.Frame(config_frame)
+        thresholds_frame.pack(padx=10, pady=5, fill='x')
+
+        # SYN Flood Threshold
+        ttk.Label(thresholds_frame, text="SYN Flood Threshold:").grid(row=0, column=0, padx=5, pady=2)
+        self.syn_flood_threshold_var = tk.IntVar(value=100)
+        syn_flood_threshold_entry = ttk.Entry(thresholds_frame, textvariable=self.syn_flood_threshold_var, width=10)
+        syn_flood_threshold_entry.grid(row=0, column=1, padx=5, pady=2)
+
+        # SYN Flood Window
+        ttk.Label(thresholds_frame, text="SYN Flood Window (sec):").grid(row=0, column=2, padx=5, pady=2)
+        self.syn_flood_window_var = tk.IntVar(value=10)
+        syn_flood_window_entry = ttk.Entry(thresholds_frame, textvariable=self.syn_flood_window_var, width=10)
+        syn_flood_window_entry.grid(row=0, column=3, padx=5, pady=2)
+
+        # Port Scan Unique Ports
+        ttk.Label(thresholds_frame, text="Port Scan Unique Ports:").grid(row=1, column=0, padx=5, pady=2)
+        self.port_scan_ports_var = tk.IntVar(value=10)
+        port_scan_ports_entry = ttk.Entry(thresholds_frame, textvariable=self.port_scan_ports_var, width=10)
+        port_scan_ports_entry.grid(row=1, column=1, padx=5, pady=2)
+
+        # Port Scan Window
+        ttk.Label(thresholds_frame, text="Port Scan Window (sec):").grid(row=1, column=2, padx=5, pady=2)
+        self.port_scan_window_var = tk.IntVar(value=60)
+        port_scan_window_entry = ttk.Entry(thresholds_frame, textvariable=self.port_scan_window_var, width=10)
+        port_scan_window_entry.grid(row=1, column=3, padx=5, pady=2)
 
         # Save Configuration Button
         save_config_btn = ttk.Button(config_frame, text="Save Configuration", command=self._save_configuration)
@@ -124,10 +367,10 @@ class LightweightIDSGUI:
             config = {
                 'whitelist_ips': [ip.strip() for ip in self.whitelist_var.get().split(',') if ip.strip()],
                 'blacklist_ips': [ip.strip() for ip in self.blacklist_var.get().split(',') if ip.strip()],
-                'syn_flood_threshold': 100,
-                'syn_flood_window': 10,
-                'port_scan_unique_ports': 10,
-                'port_scan_window': 60
+                'syn_flood_threshold': self.syn_flood_threshold_var.get(),
+                'syn_flood_window': self.syn_flood_window_var.get(),
+                'port_scan_unique_ports': self.port_scan_ports_var.get(),
+                'port_scan_window': self.port_scan_window_var.get()
             }
 
             with open(self.config_path, 'w') as f:
@@ -149,6 +392,12 @@ class LightweightIDSGUI:
             self.whitelist_var.set(', '.join(config.get('whitelist_ips', [])))
             self.blacklist_var.set(', '.join(config.get('blacklist_ips', [])))
             
+            # Update threshold variables
+            self.syn_flood_threshold_var.set(config.get('syn_flood_threshold', 100))
+            self.syn_flood_window_var.set(config.get('syn_flood_window', 10))
+            self.port_scan_ports_var.set(config.get('port_scan_unique_ports', 10))
+            self.port_scan_window_var.set(config.get('port_scan_window', 60))
+            
             messagebox.showinfo("Configuration", "Configuration loaded successfully!")
         except FileNotFoundError:
             messagebox.showwarning("Warning", "No configuration file found.")
@@ -162,15 +411,15 @@ class LightweightIDSGUI:
         if not self.is_monitoring:
             # Start monitoring
             try:
-                # Update IDS with current interface
+                # Save current configuration
+                self._save_configuration()
+                
+                # Create IDS instance with alert callback
                 self.ids = LightweightIDS(
                     interface=self.interface_var.get(), 
-                    config_path=self.config_path
+                    config_path=self.config_path,
+                    alert_callback=self._handle_alert
                 )
-                
-                # Override alert handler to use GUI
-                self.ids.alert_queue = queue.Queue()
-                self.ids.alert_handler = self._gui_alert_handler
 
                 # Start monitoring in a separate thread
                 self.monitoring_thread = threading.Thread(
@@ -196,12 +445,9 @@ class LightweightIDSGUI:
         Thread function for monitoring network
         """
         try:
-            # Start packet and alert handler threads
+            # Start packet handler thread
             packet_thread = threading.Thread(target=self.ids.packet_handler, daemon=True)
-            alert_thread = threading.Thread(target=self._gui_alert_handler, daemon=True)
-            
             packet_thread.start()
-            alert_thread.start()
             
             self._log_to_alerts(f"[*] Starting IDS monitoring on interface {self.ids.interface}")
             
@@ -219,18 +465,13 @@ class LightweightIDSGUI:
             self.is_monitoring = False
             self.monitor_button.config(text="Start Monitoring")
 
-    def _gui_alert_handler(self):
+    def _handle_alert(self, alert):
         """
-        Process and display alerts in GUI
+        Handle alerts from IDS
+        
+        :param alert: Alert dictionary
         """
-        while self.is_monitoring:
-            try:
-                alert = self.ids.alert_queue.get(timeout=1)
-                self._log_to_alerts(f"[ALERT] {json.dumps(alert, indent=2)}")
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self._log_to_alerts(f"Alert handling error: {e}")
+        self._log_to_alerts(f"[ALERT] {json.dumps(alert, indent=2)}")
 
     def _log_to_alerts(self, message):
         """
